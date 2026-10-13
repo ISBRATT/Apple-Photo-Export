@@ -15,18 +15,13 @@ struct PhotoExportApp: App {
     }
 }
 
-struct Album: Identifiable {
-    let id: String
-    let title: String
-    let collection: PHAssetCollection
-}
-
 @MainActor
 final class ExportModel: ObservableObject {
     @Published var authorized = false
     @Published var albums: [Album] = []
     @Published var selectedAlbum = "all"
     @Published var includeVideos = false
+    @Published var includeShared = true
     @Published var destination: URL?
     @Published var running = false
     @Published var completed = 0
@@ -34,6 +29,7 @@ final class ExportModel: ObservableObject {
     @Published var status = "Connect your Photos library to get started."
     @Published var log: [String] = []
     private var task: Task<Void, Never>?
+    private var layout = LibraryLayout()
 
     func connect() async {
         let permission = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
@@ -42,13 +38,11 @@ final class ExportModel: ObservableObject {
             status = "Photos access denied. Enable Apple Photo Export in System Settings → Privacy & Security → Photos."
             return
         }
-        albums = []
-        let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
-        collections.enumerateObjects { collection, _, _ in
-            self.albums.append(Album(id: collection.localIdentifier, title: collection.localizedTitle ?? "Untitled album", collection: collection))
-        }
-        albums.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        status = "Photos connected. Only items currently visible in this Mac’s Photos library are available."
+        layout = LibraryLayout.discover()
+        albums = layout.albums
+        if !albums.contains(where: { $0.id == selectedAlbum }) { selectedAlbum = "all" }
+        let sharedCount = albums.filter(\.isShared).count
+        status = "Connected: \(albums.count - sharedCount) albums, \(sharedCount) Shared Albums visible. Folder organization will be preserved."
     }
 
     func chooseDirectory() {
@@ -63,23 +57,22 @@ final class ExportModel: ObservableObject {
 
     func start() {
         guard authorized, let destination, !running else { return }
-        let options = PHFetchOptions()
-        if !includeVideos { options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue) }
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        let result: PHFetchResult<PHAsset>
-        if let album = albums.first(where: { $0.id == selectedAlbum }) {
-            result = PHAsset.fetchAssets(in: album.collection, options: options)
-        } else { result = PHAsset.fetchAssets(with: options) }
-        var assets: [PHAsset] = []
-        result.enumerateObjects { asset, _, _ in assets.append(asset) }
-        total = assets.count
+        // Refresh membership and hierarchy so edits made in Photos are reflected.
+        layout = LibraryLayout.discover()
+        albums = layout.albums
+        if selectedAlbum != "all", !albums.contains(where: { $0.id == selectedAlbum }) {
+            status = "This album is no longer available. Refresh and choose another album."
+            return
+        }
+        let plan = layout.plan(selected: selectedAlbum, includeVideos: includeVideos, includeShared: includeShared)
+        total = plan.items.count
         completed = 0
         log = []
-        guard !assets.isEmpty else { status = "No matching photos found. Check your album and iCloud Photos sync."; return }
+        guard !plan.items.isEmpty || !plan.directories.isEmpty else { status = "No matching photos found. Check your album and iCloud Photos sync."; return }
         running = true
         status = "Downloading originals from iCloud when needed…"
         task = Task {
-            await Exporter().run(assets: assets, destination: destination) { [weak self] progress in
+            await Exporter().run(plan: plan, destination: destination) { [weak self] progress in
                 guard let self else { return }
                 self.completed = progress.completed
                 self.status = progress.message
@@ -119,11 +112,16 @@ struct ContentView: View {
                             .disabled(model.running)
                     }
                     Picker("Export", selection: $model.selectedAlbum) {
-                        Text("All photos").tag("all")
-                        ForEach(model.albums) { Text($0.title).tag($0.id) }
+                        Text("Entire library · preserve folders and albums").tag("all")
+                        ForEach(model.albums.filter { !$0.isShared || model.includeShared }) { Text($0.title).tag($0.id) }
                     }.disabled(!model.authorized || model.running)
                     Toggle("Include standalone videos", isOn: $model.includeVideos).disabled(model.running)
-                    Text("Exports unmodified originals, RAW alternatives, and Live Photo companions. Albums are a filter; edited versions and album organization are not exported.")
+                    Toggle("Include Shared Albums (available shared copies)", isOn: $model.includeShared)
+                        .disabled(model.running)
+                        .onChange(of: model.includeShared) { _, enabled in
+                            if !enabled, model.albums.contains(where: { $0.id == model.selectedAlbum && $0.isShared }) { model.selectedAlbum = "all" }
+                        }
+                    Text("Preserves your folders and albums. A photo in multiple albums is copied into each. Shared Albums must be enabled in Photos and may contain reduced-resolution copies.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(8)
             }
@@ -135,12 +133,12 @@ struct ContentView: View {
                     Button("Choose folder…") { model.chooseDirectory() }.disabled(model.running)
                 }.padding(8)
             }
-            Text("Files go into “Apple Photo Export”, with a separate folder per photo. Existing files are preserved. Repeat exports verify saved files and resume missing downloads.")
+            Text("Photos go directly into their album folders; photos outside albums go into “Unfiled Photos”. Existing files are preserved, and repeat exports resume missing downloads.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 if model.running {
                     ProgressView().controlSize(.small)
-                    Text("\(model.completed) of \(model.total) assets")
+                    Text("\(model.completed) of \(model.total) album items")
                     Spacer()
                     Button("Stop export") { model.stop() }
                 } else {

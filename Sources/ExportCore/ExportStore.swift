@@ -3,12 +3,12 @@ import CryptoKit
 
 public struct ExportRecord: Codable {
     public var files: [String: Entry] = [:]
-    public var creationDate: Date?
     public struct Entry: Codable {
         public let filename: String
         public let digest: String
+        public let creationDate: Date?
     }
-    public init(creationDate: Date?) { self.creationDate = creationDate }
+    public init() {}
 }
 
 public struct ExportStore {
@@ -20,12 +20,24 @@ public struct ExportStore {
     }
 
     public static func safeName(_ value: String) -> String {
-        let name = value.components(separatedBy: CharacterSet(charactersIn: "/\\:\0").union(.controlCharacters)).joined(separator: "_")
-        return name.isEmpty || name == "." || name == ".." ? "photo" : String(name.prefix(180))
+        var name = value.components(separatedBy: CharacterSet(charactersIn: "/\\:\0").union(.controlCharacters)).joined(separator: "_")
+        while name.utf8.count > 180 { name.removeLast() }
+        return name.isEmpty || name == "." || name == ".." ? "photo" : name
     }
 
-    public func directory(for id: String) throws -> URL {
-        let url = root.appendingPathComponent(Self.identifier(id), isDirectory: true)
+    /// Resolve every level separately so existing symlinks cannot redirect writes.
+    public func directory(components: [String]) throws -> URL {
+        var url = root
+        try ensureDirectory(url)
+        for component in components {
+            guard component == Self.safeName(component) else { throw CocoaError(.fileWriteInvalidFileName) }
+            url.appendPathComponent(component, isDirectory: true)
+            try ensureDirectory(url)
+        }
+        return url
+    }
+
+    private func ensureDirectory(_ url: URL) throws {
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
             let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey])
@@ -35,19 +47,20 @@ public struct ExportStore {
         } else {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         }
-        return url
     }
 
-    public func read(in directory: URL, creationDate: Date?) throws -> ExportRecord {
-        let url = directory.appendingPathComponent("export.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return ExportRecord(creationDate: creationDate) }
+    public func read(in directory: URL) throws -> ExportRecord {
+        let url = directory.appendingPathComponent(".photo-export.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return ExportRecord() }
+        let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        guard values.isSymbolicLink != true, values.isRegularFile == true else { throw CocoaError(.fileReadInvalidFileName) }
         return try JSONDecoder().decode(ExportRecord.self, from: Data(contentsOf: url))
     }
 
     public func save(_ record: ExportRecord, in directory: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(record).write(to: directory.appendingPathComponent("export.json"), options: .atomic)
+        try encoder.encode(record).write(to: directory.appendingPathComponent(".photo-export.json"), options: .atomic)
     }
 
     public func verified(_ entry: ExportRecord.Entry, in directory: URL) throws -> Bool {
@@ -63,15 +76,15 @@ public struct ExportStore {
         let safe = Self.safeName(name)
         var url = directory.appendingPathComponent(safe)
         var counter = 1
-        while FileManager.default.fileExists(atPath: url.path) || safe == "export.json" && counter == 1 {
-            url = directory.appendingPathComponent("\(counter)-\(safe)")
+        while FileManager.default.fileExists(atPath: url.path) || safe == ".photo-export.json" && counter == 1 {
+            url = directory.appendingPathComponent(Self.safeName("\(counter)-\(safe)"))
             counter += 1
         }
         return url
     }
 
-    public func recordFile(_ url: URL, key: String, record: inout ExportRecord, directory: URL) throws {
-        record.files[key] = .init(filename: url.lastPathComponent, digest: try Self.digest(url))
+    public func recordFile(_ url: URL, key: String, creationDate: Date? = nil, record: inout ExportRecord, directory: URL) throws {
+        record.files[key] = .init(filename: url.lastPathComponent, digest: try Self.digest(url), creationDate: creationDate)
         try save(record, in: directory)
     }
 
@@ -81,5 +94,33 @@ public struct ExportStore {
         var hash = SHA256()
         while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { hash.update(data: data) }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+public struct CollectionName {
+    public let id: String
+    public let title: String
+    public init(id: String, title: String) { self.id = id; self.title = title }
+}
+
+public enum FolderNames {
+    /// Preserve readable titles, disambiguating sanitized or case-insensitive collisions.
+    public static func resolve(_ collections: [CollectionName]) -> [String: String] {
+        var result: [String: String] = [:]
+        var used = Set<String>()
+        for collection in collections.sorted(by: { $0.id < $1.id }) {
+            let base = ExportStore.safeName(collection.title)
+            var name = base
+            var counter = 1
+            while used.contains(name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))) {
+                var shortBase = base
+                while shortBase.utf8.count > 140 { shortBase.removeLast() }
+                name = "\(shortBase) (\(ExportStore.identifier(collection.id).prefix(10))-\(counter))"
+                counter += 1
+            }
+            used.insert(name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")))
+            result[collection.id] = name
+        }
+        return result
     }
 }

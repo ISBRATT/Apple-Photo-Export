@@ -12,21 +12,23 @@ struct ExportProgress: Sendable {
 }
 
 actor Exporter {
-    func run(assets: [PHAsset], destination: URL, progress: @escaping @MainActor @Sendable (ExportProgress) -> Void) async {
+    func run(plan: ExportPlan, destination: URL, progress: @escaping @MainActor @Sendable (ExportProgress) -> Void) async {
         let root = destination.appendingPathComponent("Apple Photo Export", isDirectory: true)
         let store = ExportStore(root: root)
         var exported = 0, skipped = 0, failed = 0, completed = 0
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            guard try root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
-                throw CocoaError(.fileWriteInvalidFileName)
-            }
-            for asset in assets {
+            _ = try store.directory(components: [])
+            for path in plan.directories {
                 try Task.checkCancellation()
+                _ = try store.directory(components: path)
+            }
+            for item in plan.items {
+                try Task.checkCancellation()
+                let asset = item.asset
                 var message = ""
                 do {
-                    let directory = try store.directory(for: asset.localIdentifier)
-                    var record = try store.read(in: directory, creationDate: asset.creationDate)
+                    let directory = try store.directory(components: item.path)
+                    var record = try store.read(in: directory)
                     // Original stills, RAW alternatives, videos and Live Photo companions.
                     let resources = PHAssetResource.assetResources(for: asset).filter {
                         [.photo, .alternatePhoto, .video, .pairedVideo, .audio].contains($0.type)
@@ -34,7 +36,7 @@ actor Exporter {
                     guard !resources.isEmpty else { throw CocoaError(.fileReadUnknown) }
                     for (index, resource) in resources.enumerated() {
                         try Task.checkCancellation()
-                        let key = "\(resource.type.rawValue)-\(index)-\(resource.originalFilename)"
+                        let key = "\(ExportStore.identifier(asset.localIdentifier))-\(resource.type.rawValue)-\(index)-\(resource.originalFilename)"
                         if let entry = record.files[key], try store.verified(entry, in: directory) {
                             skipped += 1
                             continue
@@ -48,26 +50,26 @@ actor Exporter {
                             if let date = asset.creationDate {
                                 try FileManager.default.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: target.path)
                             }
-                            try store.recordFile(target, key: key, record: &record, directory: directory)
+                            try store.recordFile(target, key: key, creationDate: asset.creationDate, record: &record, directory: directory)
                             exported += 1
                         } catch {
                             try? FileManager.default.removeItem(at: temporary)
                             throw error
                         }
                     }
-                    message = "Processed \(resources.first?.originalFilename ?? "photo")"
+                    message = "\(item.path.joined(separator: " / ")): \(resources.first?.originalFilename ?? "photo")\(item.isShared ? " (shared copy)" : "")"
                 } catch is CancellationError { throw CancellationError() }
                 catch {
                     failed += 1
-                    message = "Failed asset \(ExportStore.identifier(asset.localIdentifier).prefix(12)): \(error.localizedDescription)"
+                    message = "Failed in \(item.path.joined(separator: " / ")): \(error.localizedDescription)\(item.isShared ? " — this shared item may not be downloadable through Photos." : "")"
                 }
                 completed += 1
-                await progress(.init(completed: completed, total: assets.count, exported: exported, skipped: skipped, failed: failed, message: message))
+                await progress(.init(completed: completed, total: plan.items.count, exported: exported, skipped: skipped, failed: failed, message: message))
             }
-            await progress(.init(completed: completed, total: assets.count, exported: exported, skipped: skipped, failed: failed, message: "Finished. \(exported) files exported, \(skipped) verified files skipped, \(failed) assets failed."))
+            await progress(.init(completed: completed, total: plan.items.count, exported: exported, skipped: skipped, failed: failed, message: "Finished. \(exported) files exported, \(skipped) verified files skipped, \(failed) album items failed."))
         } catch {
             let message = error is CancellationError ? "Export stopped. Completed files are saved; run again to resume." : "Export stopped: \(error.localizedDescription)"
-            await progress(.init(completed: completed, total: assets.count, exported: exported, skipped: skipped, failed: failed, message: message))
+            await progress(.init(completed: completed, total: plan.items.count, exported: exported, skipped: skipped, failed: failed, message: message))
         }
     }
 
