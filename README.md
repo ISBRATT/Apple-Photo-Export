@@ -14,7 +14,7 @@ bash scripts/build-app.sh
 open 'dist/Apple Photo Export.app'
 ```
 
-The script runs the unit tests, builds a release executable, creates a bundle with the required Photos permission description, and signs it locally. This is a local development build, not a notarized distribution. Launch the app bundle rather than running the bare executable so macOS can identify its Photos permission request.
+The script builds a release executable, creates a bundle with the required Photos permission description, and signs it locally. Unit tests run separately and are required in CI. This is a local development build, not a notarized distribution. Launch the app bundle rather than running the bare executable so macOS can identify its Photos permission request.
 
 ## Export your library
 
@@ -50,5 +50,7 @@ bash scripts/build-app.sh
 ```
 
 Unit tests exercise checksum-based resume, file corruption, missing files, filename collisions, path handling, and symlink rejection. GitHub Actions builds and tests on macOS and uploads the app bundle as a ZIP.
+
+If `swift test` reports that `XCTest` cannot be found, use full Xcode for tests. After installing Xcode and completing its first-launch setup, run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`. Some Command Line Tools installations do not provide the XCTest framework. This does not prevent using the app build script, which builds only the application product.
 
 The Linux cloud workspace cannot compile Apple's Photos/SwiftUI frameworks. macOS compilation, permission prompts, and live iCloud downloads must be validated on a Mac. For a manual smoke test, export an album containing an iCloud-only photo, a Live Photo, and a RAW photo if available. Confirm outputs open correctly, rerun and confirm verified files are skipped, then delete one exported original and rerun to confirm recovery. Also check permission denial, cancellation, and a disconnected destination drive. No live Apple account has been used for testing in the cloud workspace.

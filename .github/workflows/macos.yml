@@ -5,7 +5,9 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Test and build app bundle
+      - name: Run unit tests
+        run: swift test
+      - name: Build app bundle
         run: bash scripts/build-app.sh
       - name: Archive app
         run: ditto -c -k --sequesterRsrc --keepParent 'dist/Apple Photo Export.app' dist/ApplePhotoExport.zip
